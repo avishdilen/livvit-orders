@@ -1,5 +1,5 @@
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
+
 // === DIRECT-TO-SUPABASE UPLOAD HELPERS (paste once, above your component) ===
 async function getSignedUpload(orderNo, filename) {
   const r = await fetch("/.netlify/functions/sign-upload", {
@@ -13,10 +13,11 @@ async function getSignedUpload(orderNo, filename) {
   }
   return json; // { signedUrl, path }
 }
+
 function makeOrderNo() {
   const d = new Date();
-  const ymd = d.toISOString().slice(0,10).replace(/-/g,"");
-  const rand = Math.random().toString(36).slice(2,6).toUpperCase();
+  const ymd = d.toISOString().slice(0, 10).replace(/-/g, "");
+  const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
   return `LIV-${ymd}-${rand}`;
 }
 
@@ -28,6 +29,8 @@ async function uploadFileToSignedUrl(signedUrl, file) {
   });
   if (!put.ok) throw new Error(`PUT failed: ${put.status}`);
 }
+
+// --- UI primitives ---
 const Card = ({ className = "", children }) => (
   <div className={`rounded-2xl shadow-sm border border-gray-200 bg-white ${className}`}>{children}</div>
 );
@@ -66,6 +69,7 @@ const Switch = ({ checked, onChange }) => (
   </button>
 );
 
+// --- helpers ---
 const currency = (v) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number.isFinite(v) ? v : 0);
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const toFeet = (val, unit) => (unit === "ft" ? val : val / 12);
@@ -465,13 +469,6 @@ export default function App() {
     note: "Use the ORDER NUMBER as the payment reference.",
   };
 
-  const makeOrderNo = () => {
-    const d = new Date();
-    const ymd = d.toISOString().slice(0, 10).replace(/-/g, "");
-    const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
-    return `LIV-${ymd}-${rand}`;
-  };
-
   const uploadRefs = useRef({});
 
   const setItem = (idx, patch) => {
@@ -498,7 +495,6 @@ export default function App() {
     return [...prev.slice(0, idx + 1), copy, ...prev.slice(idx + 1)];
   });
 
-  const openFile = (idx) => uploadRefs.current[idx]?.click();
   const onFileInputChange = (idx, e) => {
     const list = Array.from(e.target.files || []);
     if (list.length) setItem(idx, (it) => ({ ...it, files: [...(it.files || []), ...list].slice(0, 5) }));
@@ -542,69 +538,67 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-// === REPLACE your existing submitOrder with this (inside your component) ===
-const submitOrder = async () => {
-  try {
-    setSubmitting(true);
-    setSubmitMsg("");
+  // === submitOrder (direct-to-Supabase + JSON to function) ===
+  const submitOrder = async () => {
+    try {
+      setSubmitting(true);
+      setSubmitMsg("");
 
-    // 1) Ensure we have an order number
-    const currentOrderNo = orderNo || makeOrderNo();
-    if (!orderNo) setOrderNo(currentOrderNo);
+      // 1) Ensure we have an order number
+      const currentOrderNo = orderNo || makeOrderNo();
+      if (!orderNo) setOrderNo(currentOrderNo);
 
-    // 2) Upload every file directly to Supabase (no size limits)
-    const uploadedPaths = [];
-    for (const it of items) {
-      for (const file of (it.files || [])) {
-        // Frontend cap to prevent surprise huge uploads (adjust as you like)
-        const MAX_MB = 100;
-        if (file.size > MAX_MB * 1024 * 1024) {
-          throw new Error(`"${file.name}" exceeds ${MAX_MB}MB limit.`);
+      // 2) Upload every file directly to Supabase (no size limits)
+      const uploadedPaths = [];
+      for (const it of items) {
+        for (const file of (it.files || [])) {
+          const MAX_MB = 100; // front-end cap
+          if (file.size > MAX_MB * 1024 * 1024) {
+            throw new Error(`"${file.name}" exceeds ${MAX_MB}MB limit.`);
+          }
+
+          const { signedUrl, path } = await getSignedUpload(currentOrderNo, file.name);
+          await uploadFileToSignedUrl(signedUrl, file);
+          uploadedPaths.push(path); // bucket-relative path like "LIV-YYYYMMDD-ABCD/filename.pdf"
         }
-
-        const { signedUrl, path } = await getSignedUpload(currentOrderNo, file.name);
-        await uploadFileToSignedUrl(signedUrl, file);
-        uploadedPaths.push(path); // e.g., "orders/LIV-20250907-ABCD/filename.pdf"
       }
+
+      // 3) Build JSON metadata ONLY (no FormData)
+      const meta = {
+        timestamp: new Date().toISOString(),
+        orderNo: currentOrderNo,
+        customer,
+        items: items.map((it, i) => ({
+          ...it,
+          productLabel: PRODUCTS[it.product].label,
+          areaSqFtPerItem: itemPrices[i].area,
+          priceBreakdown: itemPrices[i],
+        })),
+        totals: { orderSubtotal, orderDiscount, orderTotal },
+        bank: BANK,
+      };
+
+      // 4) Call the Netlify function with JSON
+      const res = await fetch("/.netlify/functions/create-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ meta, uploadedPaths }),
+      });
+
+      if (!res.ok) {
+        const errTxt = await res.text();
+        throw new Error(`create-order failed: ${errTxt}`);
+      }
+
+      await res.json();
+      setSubmitMsg("Order sent! Check your inbox for confirmation.");
+    } catch (e) {
+      console.warn("Submit error:", e);
+      setSubmitMsg(e.message || "Something went wrong while sending your order.");
+    } finally {
+      setSubmitting(false);
     }
-
-    // 3) Build JSON metadata ONLY (no FormData, no binaries)
-    const meta = {
-      timestamp: new Date().toISOString(),
-      orderNo: currentOrderNo,
-      customer,
-      items: items.map((it, i) => ({
-        ...it,
-        productLabel: PRODUCTS[it.product].label,
-        areaSqFtPerItem: itemPrices[i].area,
-        priceBreakdown: itemPrices[i],
-      })),
-      totals: { orderSubtotal, orderDiscount, orderTotal },
-      bank: BANK,
-    };
-
-    // 4) Call the Netlify function with JSON (files already uploaded)
-    const res = await fetch("/.netlify/functions/create-order", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ meta, uploadedPaths }),
-    });
-
-    if (!res.ok) {
-      const errTxt = await res.text();
-      throw new Error(`create-order failed: ${errTxt}`);
-    }
-
-    const data = await res.json();
-    // data.files contains signed read URLs (valid ~7 days)
-    setSubmitMsg("Order sent! Check your inbox for confirmation.");
-  } catch (e) {
-    console.warn("Submit error:", e);
-    setSubmitMsg(e.message || "Something went wrong while sending your order.");
-  } finally {
-    setSubmitting(false);
-  }
-};
+  };
 
   const copyBank = async () => {
     const text = `ORDER: ${orderNo || "(pending)"}\nPay: ${BANK.beneficiary}\nBank: ${BANK.bankName}\nAccount: ${BANK.account}\nIBAN: ${BANK.iban}\nSWIFT: ${BANK.swift}\nCurrency: ${BANK.currency}\nReference: ${orderNo || "(pending)"}`;
@@ -623,7 +617,7 @@ const submitOrder = async () => {
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-black text-white font-bold">L</div>
             <div>
               <p className="text-lg font-semibold">Livvitt — Custom Print Ordering</p>
-              <p className="text-xs text-gray-500">Multi‑item banners & signs configurator</p>
+              <p className="text-xs text-gray-500">Multi-item banners & signs configurator</p>
             </div>
           </div>
           <div className="hidden md:flex items-center gap-2">
@@ -689,7 +683,7 @@ const submitOrder = async () => {
                 </div>
                 <div>
                   <Label htmlFor="phone">Phone</Label>
-                  <Input id="phone" value={customer.phone} onChange={(e) => setCustomer((c) => ({ ...c, phone: e.target.value }))} placeholder="(555) 555‑5555" />
+                  <Input id="phone" value={customer.phone} onChange={(e) => setCustomer((c) => ({ ...c, phone: e.target.value }))} placeholder="(555) 555-5555" />
                 </div>
               </div>
             </CardContent>
