@@ -1,6 +1,33 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+// === DIRECT-TO-SUPABASE UPLOAD HELPERS (paste once, above your component) ===
+async function getSignedUpload(orderNo, filename) {
+  const r = await fetch("/.netlify/functions/sign-upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orderNo, filename }),
+  });
+  const json = await r.json();
+  if (!r.ok || json.error) {
+    throw new Error(json.error || "sign-upload failed");
+  }
+  return json; // { signedUrl, path }
+}
+function makeOrderNo() {
+  const d = new Date();
+  const ymd = d.toISOString().slice(0,10).replace(/-/g,"");
+  const rand = Math.random().toString(36).slice(2,6).toUpperCase();
+  return `LIV-${ymd}-${rand}`;
+}
 
+async function uploadFileToSignedUrl(signedUrl, file) {
+  const put = await fetch(signedUrl, {
+    method: "PUT",
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file,
+  });
+  if (!put.ok) throw new Error(`PUT failed: ${put.status}`);
+}
 const Card = ({ className = "", children }) => (
   <div className={`rounded-2xl shadow-sm border border-gray-200 bg-white ${className}`}>{children}</div>
 );
@@ -515,13 +542,36 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const submitOrder = async () => {
+// === REPLACE your existing submitOrder with this (inside your component) ===
+const submitOrder = async () => {
+  try {
     setSubmitting(true);
     setSubmitMsg("");
 
+    // 1) Ensure we have an order number
+    const currentOrderNo = orderNo || makeOrderNo();
+    if (!orderNo) setOrderNo(currentOrderNo);
+
+    // 2) Upload every file directly to Supabase (no size limits)
+    const uploadedPaths = [];
+    for (const it of items) {
+      for (const file of (it.files || [])) {
+        // Frontend cap to prevent surprise huge uploads (adjust as you like)
+        const MAX_MB = 100;
+        if (file.size > MAX_MB * 1024 * 1024) {
+          throw new Error(`"${file.name}" exceeds ${MAX_MB}MB limit.`);
+        }
+
+        const { signedUrl, path } = await getSignedUpload(currentOrderNo, file.name);
+        await uploadFileToSignedUrl(signedUrl, file);
+        uploadedPaths.push(path); // e.g., "orders/LIV-20250907-ABCD/filename.pdf"
+      }
+    }
+
+    // 3) Build JSON metadata ONLY (no FormData, no binaries)
     const meta = {
       timestamp: new Date().toISOString(),
-      orderNo: orderNo || makeOrderNo(),
+      orderNo: currentOrderNo,
       customer,
       items: items.map((it, i) => ({
         ...it,
@@ -533,21 +583,28 @@ export default function App() {
       bank: BANK,
     };
 
-    const form = new FormData();
-    form.append("meta", new Blob([JSON.stringify(meta)], { type: "application/json" }), "meta.json");
-    items.forEach((it, i) => (it.files || []).forEach((file, j) => form.append("files", file, `item${i}_${file.name}`)));
+    // 4) Call the Netlify function with JSON (files already uploaded)
+    const res = await fetch("/.netlify/functions/create-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ meta, uploadedPaths }),
+    });
 
-    try {
-      const res = await fetch("/.netlify/functions/create-order", { method: "POST", body: form });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setSubmitMsg("Order sent! Check your inbox for confirmation.");
-    } catch (e) {
-      console.warn("Submit error:", e);
-      setSubmitMsg("Demo mode: No backend connected. Deploy to Netlify with env vars to email & store files.");
-    } finally {
-      setSubmitting(false);
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(`create-order failed: ${errTxt}`);
     }
-  };
+
+    const data = await res.json();
+    // data.files contains signed read URLs (valid ~7 days)
+    setSubmitMsg("Order sent! Check your inbox for confirmation.");
+  } catch (e) {
+    console.warn("Submit error:", e);
+    setSubmitMsg(e.message || "Something went wrong while sending your order.");
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   const copyBank = async () => {
     const text = `ORDER: ${orderNo || "(pending)"}\nPay: ${BANK.beneficiary}\nBank: ${BANK.bankName}\nAccount: ${BANK.account}\nIBAN: ${BANK.iban}\nSWIFT: ${BANK.swift}\nCurrency: ${BANK.currency}\nReference: ${orderNo || "(pending)"}`;
