@@ -153,17 +153,16 @@ function ItemCard({ line, idx, onChange, onDuplicate, onRemove, draftId }){
   const estGrommets = useMemo(()=>grommetEstimate(ft(line.width, line.unit), ft(line.height, line.unit)), [line.width, line.height, line.unit])
 
   const quick = product.quick || []
-
   const set = (patch)=>onChange({ ...line, ...patch })
 
-  // if switching product, reset to defaults of new product
+  // when switching product, reset to defaults of new product
   function chooseProduct(code){
     const p = PRODUCTS.find(x=>x.code===code) || PRODUCTS[0]
     onChange({
       ...emptyLine(p),
-      id: line.id, // keep same card id
-      qty: line.qty, // preserve qty when switching
-      uploads: line.uploads, // keep uploaded files tied to this line
+      id: line.id,           // keep same card id
+      qty: line.qty,         // preserve qty
+      uploads: line.uploads, // keep uploads
       opts: line.opts
     })
   }
@@ -503,10 +502,7 @@ function CheckoutBox({ items, totals, contact, note, onPlaced, placing, setPlaci
 
   function downloadJSON(){
     const orderNo = makeOrderNo()
-    const order = {
-      ...toOrderJSON(orderNo),
-      status: 'downloaded-only'
-    }
+    const order = { ...toOrderJSON(orderNo), status: 'downloaded-only' }
     const blob = new Blob([JSON.stringify(order, null, 2)], {type:'application/json'})
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')

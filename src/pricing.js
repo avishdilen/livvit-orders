@@ -52,7 +52,7 @@ export const PRODUCTS = [
     code: 'standup',
     name: 'Stand Up Banner (33" × 80")',
     kind: 'package',
-    fixedPrice: 180.00, // change to your real price
+    fixedPrice: 180.00, // set your real price
     fixedDims: { widthIn: 33, heightIn: 80 },
     note: 'Includes hardware & print. Fixed size.',
     image: '',
@@ -63,7 +63,7 @@ export const PRODUCTS = [
     code: 'aframe',
     name: 'A-Frame Sign (Double-Sided 24" × 36")',
     kind: 'package',
-    fixedPrice: 225.00, // change to your real price
+    fixedPrice: 225.00, // set your real price
     options: { Color: ['White','Black'] }, // informational; not price-affecting
     fixedDims: { widthIn: 24, heightIn: 36 },
     note: 'Includes frame & two 24×36" inserts. Choose white or black frame.',

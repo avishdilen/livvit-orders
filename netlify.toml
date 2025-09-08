@@ -1,9 +1,12 @@
 [build]
   command = "npm run build"
-  publish  = "dist"
-  functions = "functions"   # <- change from netlify/functions to functions
+  publish = "dist"
+  functions = "functions"
+
+[functions]
+  node_bundler = "esbuild"
 
 [[redirects]]
   from = "/*"
-  to   = "/index.html"
+  to = "/index.html"
   status = 200
