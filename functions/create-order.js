@@ -3,23 +3,24 @@ const { createClient } = require("@supabase/supabase-js");
 const Busboy = require("busboy");
 const { Resend } = require("resend");
 
-// --- Env ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // service_role (NOT anon)
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const ORDERS_EMAIL_TO = process.env.ORDERS_EMAIL_TO;             // e.g., info@livvittplus.com
-const ORDERS_EMAIL_FROM = process.env.ORDERS_EMAIL_FROM;         // e.g., orders@yourdomain.com (or onboarding@resend.dev)
+const ORDERS_EMAIL_TO = process.env.ORDERS_EMAIL_TO;
+const ORDERS_EMAIL_FROM = process.env.ORDERS_EMAIL_FROM;
 
 const resend = new Resend(RESEND_API_KEY);
+const sanitize = (s) => String(s || "").replace(/[^a-z0-9._-]+/gi, "-");
 
-// Parse multipart/form-data from Netlify event
+// -------- helpers --------
+
 function parseMultipart(event) {
   return new Promise((resolve, reject) => {
     const headers = event.headers || {};
     const contentType = headers["content-type"] || headers["Content-Type"];
     if (!contentType) return reject(new Error("Missing content-type"));
-    const bb = Busboy({ headers: { "content-type": contentType } });
 
+    const bb = Busboy({ headers: { "content-type": contentType } });
     const fields = {};
     const files = [];
 
@@ -49,84 +50,21 @@ function parseMultipart(event) {
   });
 }
 
-const sanitize = (s) => String(s || "").replace(/[^a-z0-9._-]+/gi, "-");
+async function emailOrder(meta, fileLinks) {
+  const { orderNo, customer, items, totals, bank } = meta;
 
-exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
+  const lines = (items || [])
+    .map(
+      (it) =>
+        `• ${it.productLabel || it.product} — ${it.width}${it.unit} × ${it.height}${it.unit} × ${it.quantity}`
+    )
+    .join("\n");
 
-  try {
-    // 1) Parse form
-    const { fields, files } = await parseMultipart(event);
+  const linksText = (fileLinks || []).length
+    ? fileLinks.map((f) => `- ${f.path.split("/").pop()}: ${f.url}`).join("\n")
+    : "(no files attached)";
 
-    // meta.json can come as a field or a file
-    let meta;
-    const metaFile = files.find(
-      (f) => f.fieldname === "meta" || (f.filename || "").toLowerCase() === "meta.json"
-    );
-    if (metaFile) {
-      meta = JSON.parse(metaFile.data.toString("utf8"));
-    } else if (fields.meta) {
-      meta = JSON.parse(fields.meta);
-    } else {
-      return { statusCode: 400, body: JSON.stringify({ error: "Missing meta" }) };
-    }
-
-    const { orderNo, customer, items, totals, bank } = meta;
-    if (!orderNo) {
-      return { statusCode: 400, body: JSON.stringify({ error: "Missing orderNo in meta" }) };
-    }
-
-    // 2) Upload files to Supabase Storage
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
-
-    const bucket = "orders"; // must exist (private)
-    const uploadedKeys = [];
-
-    for (const f of files) {
-      if (f === metaFile) continue;         // skip meta.json
-      if (f.fieldname !== "files") continue; // only artwork files
-
-      const key = `orders/${sanitize(orderNo)}/${sanitize(f.filename)}`;
-      const { error: upErr } = await supabase
-        .storage
-        .from(bucket)
-        .upload(key, f.data, { contentType: f.contentType, upsert: true });
-
-      if (upErr) {
-        return { statusCode: 500, body: JSON.stringify({ error: "Upload failed", detail: upErr.message }) };
-      }
-      uploadedKeys.push(key);
-    }
-
-    // 3) Create signed URLs (valid 7 days)
-    let fileLinks = [];
-    if (uploadedKeys.length) {
-      const { data, error } = await supabase
-        .storage
-        .from(bucket)
-        .createSignedUrls(uploadedKeys, 60 * 60 * 24 * 7);
-
-      if (error) {
-        return { statusCode: 500, body: JSON.stringify({ error: "Signed URL error", detail: error.message }) };
-      }
-      fileLinks = (data || []).map((d) => ({ path: d.path, url: d.signedUrl }));
-    }
-
-    // 4) Send email via Resend
-    const lines = (items || [])
-      .map(
-        (it) =>
-          `• ${it.productLabel || it.product} — ${it.width}${it.unit} × ${it.height}${it.unit} × ${it.quantity}`
-      )
-      .join("\n");
-
-    const linksText = fileLinks.length
-      ? fileLinks.map((f) => `- ${f.path.split("/").pop()}: ${f.url}`).join("\n")
-      : "(no files attached)";
-
-    const text = `
+  const text = `
 NEW ORDER: ${orderNo}
 
 Customer:
@@ -141,7 +79,7 @@ Totals:
   Discounts: ${totals?.orderDiscount ?? ""}
   Total: ${totals?.orderTotal ?? ""}
 
-Bank Transfer (share with customer if unpaid):
+Bank Transfer (if applicable):
   Beneficiary: ${bank?.beneficiary || ""}
   Bank: ${bank?.bankName || ""}
   Account: ${bank?.account || ""}
@@ -154,29 +92,135 @@ Files:
 ${linksText}
 `.trim();
 
-    // send to you + customer (if provided)
-    try {
-      await resend.emails.send({
-        from: ORDERS_EMAIL_FROM,
-        to: [ORDERS_EMAIL_TO, customer?.email].filter(Boolean),
-        subject: `Order ${orderNo} — Files & Details`,
-        text,
-      });
-      console.log("Resend OK for order:", orderNo);
-    } catch (e) {
-      console.error("Resend FAILED:", e?.message || e);
-      // still return 200 so customer gets confirmation in the UI; you can inspect function logs
+  try {
+    await resend.emails.send({
+      from: ORDERS_EMAIL_FROM,
+      to: [ORDERS_EMAIL_TO, customer?.email].filter(Boolean),
+      subject: `Order ${orderNo} — Files & Details`,
+      text,
+    });
+    console.log("Resend OK for order:", orderNo);
+  } catch (e) {
+    console.error("Resend FAILED:", e?.message || e);
+  }
+}
+
+// -------- main handler --------
+
+exports.handler = async (event) => {
+  try {
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: "Method Not Allowed" };
     }
 
-    // 5) Respond
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
+
+    // Normalize headers (case-insensitive)
+    const H = Object.fromEntries(
+      Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
+    );
+    const ct = (H["content-type"] || "").toLowerCase();
+
+    // ---- Mode A: JSON body (direct-upload path) ----
+    // Accept 'application/json' (with charset) and also 'text/plain' if the payload is JSON.
+    const looksLikeJson =
+      ct.includes("application/json") ||
+      (ct.includes("text/plain") && typeof event.body === "string" && event.body.trim().startsWith("{"));
+
+    if (looksLikeJson) {
+      let parsed;
+      try {
+        parsed = JSON.parse(event.body || "{}");
+      } catch (e) {
+        return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON body" }) };
+      }
+
+      const { meta, uploadedPaths = [] } = parsed;
+      if (!meta?.orderNo) {
+        return { statusCode: 400, body: JSON.stringify({ error: "Missing meta.orderNo" }) };
+      }
+
+      // Ensure bucket-relative paths (strip any accidental "orders/")
+      const relPaths = uploadedPaths.map((p) => String(p).replace(/^orders\//, ""));
+
+      let fileLinks = [];
+      if (relPaths.length) {
+        const { data, error } = await supabase
+          .storage
+          .from("orders")
+          .createSignedUrls(relPaths, 60 * 60 * 24 * 7);
+
+        if (error) {
+          return {
+            statusCode: 500,
+            body: JSON.stringify({ error: "Signed URL error", detail: error.message }),
+          };
+        }
+        fileLinks = data.map((d) => ({ path: d.path, url: d.signedUrl }));
+      }
+
+      await emailOrder(meta, fileLinks);
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          ok: true,
+          orderNo: meta.orderNo,
+          uploaded: relPaths.length,
+          files: fileLinks,
+        }),
+      };
+    }
+
+    // ---- Mode B: Multipart FormData (legacy small-file path) ----
+    const { fields, files } = await parseMultipart(event);
+
+    // meta.json can be a field or a file
+    let meta;
+    const metaFile = files.find(
+      (f) => f.fieldname === "meta" || (f.filename || "").toLowerCase() === "meta.json"
+    );
+    if (metaFile) meta = JSON.parse(metaFile.data.toString("utf8"));
+    else if (fields.meta) meta = JSON.parse(fields.meta);
+    else return { statusCode: 400, body: JSON.stringify({ error: "Missing meta" }) };
+
+    if (!meta?.orderNo) return { statusCode: 400, body: JSON.stringify({ error: "Missing orderNo in meta" }) };
+
+    const uploadedKeys = [];
+    for (const f of files) {
+      if (f === metaFile) continue;
+      if (f.fieldname !== "files") continue;
+
+      // Store at bucket-relative key (NO leading "orders/")
+      const key = `${sanitize(meta.orderNo)}/${sanitize(f.filename)}`;
+
+      const { error: upErr } = await supabase
+        .storage
+        .from("orders")
+        .upload(key, f.data, { contentType: f.contentType, upsert: true });
+
+      if (upErr) {
+        return { statusCode: 500, body: JSON.stringify({ error: "Upload failed", detail: upErr.message }) };
+      }
+      uploadedKeys.push(key);
+    }
+
+    let fileLinks = [];
+    if (uploadedKeys.length) {
+      const { data, error } = await supabase
+        .storage
+        .from("orders")
+        .createSignedUrls(uploadedKeys, 60 * 60 * 24 * 7);
+
+      if (error) {
+        return { statusCode: 500, body: JSON.stringify({ error: "Signed URL error", detail: error.message }) };
+      }
+      fileLinks = (data || []).map((d) => ({ path: d.path, url: d.signedUrl }));
+    }
+
+    await emailOrder(meta, fileLinks);
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        ok: true,
-        orderNo,
-        uploaded: uploadedKeys.length,
-        files: fileLinks,
-      }),
+      body: JSON.stringify({ ok: true, orderNo: meta.orderNo, uploaded: uploadedKeys.length, files: fileLinks }),
     };
   } catch (e) {
     console.error("create-order error:", e);
