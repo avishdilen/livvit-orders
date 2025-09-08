@@ -185,13 +185,26 @@ exports.handler = async (event) => {
 
     if (!meta?.orderNo) return { statusCode: 400, body: JSON.stringify({ error: "Missing orderNo in meta" }) };
 
+    const fileProductMap = {};
+    (meta.items || []).forEach((it) => {
+      (it.files || []).forEach((fn) => {
+        const name = typeof fn === "string" ? fn : fn?.name;
+        if (name) fileProductMap[name] = it.product;
+      });
+    });
+
     const uploadedKeys = [];
     for (const f of files) {
       if (f === metaFile) continue;
       if (f.fieldname !== "files") continue;
 
+      const product = fileProductMap[f.filename] || fields[`product_${f.fieldname}`] || fields.product;
+      if (!product) {
+        return { statusCode: 400, body: JSON.stringify({ error: `Missing product for file ${f.filename}` }) };
+      }
+
       // Store at bucket-relative key (NO leading "orders/")
-      const key = `${sanitize(meta.orderNo)}/${sanitize(f.filename)}`;
+      const key = `${sanitize(meta.orderNo)}/${sanitize(product)}/${sanitize(f.filename)}`;
 
       const { error: upErr } = await supabase
         .storage

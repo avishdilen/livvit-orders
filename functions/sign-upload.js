@@ -14,14 +14,14 @@ exports.handler = async (event) => {
       return { statusCode: 405, body: "Method Not Allowed" };
     }
 
-    const { orderNo, filename } = JSON.parse(event.body || "{}");
-    if (!orderNo || !filename) {
-      return { statusCode: 400, body: JSON.stringify({ error: "orderNo and filename required" }) };
+    const { orderNo, product, filename } = JSON.parse(event.body || "{}");
+    if (!orderNo || !product || !filename) {
+      return { statusCode: 400, body: JSON.stringify({ error: "orderNo, product, and filename required" }) };
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-    const objectPath = `orders/${sanitize(orderNo)}/${sanitize(filename)}`;
+    const objectPath = `orders/${sanitize(orderNo)}/${sanitize(product)}/${sanitize(filename)}`;
     const { data, error } = await supabase
       .storage
       .from("orders")

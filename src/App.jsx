@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 // === DIRECT-TO-SUPABASE UPLOAD HELPERS (paste once, above your component) ===
-async function getSignedUpload(orderNo, filename) {
+async function getSignedUpload(orderNo, product, filename) {
   const r = await fetch("/.netlify/functions/sign-upload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ orderNo, filename }),
+    body: JSON.stringify({ orderNo, product, filename }),
   });
   const json = await r.json();
   if (!r.ok || json.error) {
@@ -557,7 +557,7 @@ export default function App() {
             throw new Error(`"${file.name}" exceeds ${MAX_MB}MB limit.`);
           }
 
-          const { signedUrl, path } = await getSignedUpload(currentOrderNo, file.name);
+          const { signedUrl, path } = await getSignedUpload(currentOrderNo, it.product, file.name);
           await uploadFileToSignedUrl(signedUrl, file);
           uploadedPaths.push(path); // bucket-relative path like "LIV-YYYYMMDD-ABCD/filename.pdf"
         }
