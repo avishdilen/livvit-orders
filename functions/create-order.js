@@ -4,7 +4,7 @@ const Busboy = require("busboy");
 const { Resend } = require("resend");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // service_role (NOT anon)
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // service_role
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ORDERS_EMAIL_TO = process.env.ORDERS_EMAIL_TO;
 const ORDERS_EMAIL_FROM = process.env.ORDERS_EMAIL_FROM;
@@ -12,8 +12,7 @@ const ORDERS_EMAIL_FROM = process.env.ORDERS_EMAIL_FROM;
 const resend = new Resend(RESEND_API_KEY);
 const sanitize = (s) => String(s || "").replace(/[^a-z0-9._-]+/gi, "-");
 
-// -------- helpers --------
-
+// ---------- helpers ----------
 function parseMultipart(event) {
   return new Promise((resolve, reject) => {
     const headers = event.headers || {};
@@ -30,8 +29,7 @@ function parseMultipart(event) {
       file.on("data", (d) => chunks.push(d));
       file.on("end", () => {
         files.push({
-          fieldname,
-          filename,
+          fieldname, filename,
           contentType: mimeType || "application/octet-stream",
           data: Buffer.concat(chunks),
         });
@@ -42,27 +40,32 @@ function parseMultipart(event) {
     bb.on("error", reject);
     bb.on("finish", () => resolve({ fields, files }));
 
-    const body = event.isBase64Encoded
-      ? Buffer.from(event.body || "", "base64")
-      : Buffer.from(event.body || "", "utf8");
-
+    const body = event.isBase64Encoded ? Buffer.from(event.body || "", "base64")
+                                       : Buffer.from(event.body || "", "utf8");
     bb.end(body);
   });
 }
 
-async function emailOrder(meta, fileLinks) {
-  const { orderNo, customer, items, totals, bank } = meta;
+function groupLinksByItem(meta, filesByItem) {
+  // Build an email section per line item
+  const byId = {};
+  (filesByItem || []).forEach(f => {
+    (byId[f.itemId] = byId[f.itemId] || []).push(f.url);
+  });
 
-  const lines = (items || [])
-    .map(
-      (it) =>
-        `• ${it.productLabel || it.product} — ${it.width}${it.unit} × ${it.height}${it.unit} × ${it.quantity}`
-    )
-    .join("\n");
+  const lines = (meta.items || []).map((it, idx) => {
+    const files = byId[it.id] || [];
+    const title = `${idx + 1}) ${it.productLabel || it.product} — ${it.width}${it.unit} × ${it.height}${it.unit} × ${it.quantity}`;
+    const list = files.length ? files.map(u => `     - ${u}`).join("\n") : "     (no file)";
+    return `${title}\n${list}`;
+  }).join("\n\n");
 
-  const linksText = (fileLinks || []).length
-    ? fileLinks.map((f) => `- ${f.path.split("/").pop()}: ${f.url}`).join("\n")
-    : "(no files attached)";
+  return lines || "(no line items provided)";
+}
+
+async function emailOrder(meta, filesByItem) {
+  const { orderNo, customer, totals, bank } = meta;
+  const itemSection = groupLinksByItem(meta, filesByItem);
 
   const text = `
 NEW ORDER: ${orderNo}
@@ -71,8 +74,8 @@ Customer:
   ${customer?.name || ""}
   ${customer?.email || ""}${customer?.phone ? " / " + customer.phone : ""}
 
-Items:
-${lines || "(no line items provided)"}
+Items & Files:
+${itemSection}
 
 Totals:
   Subtotal: ${totals?.orderSubtotal ?? ""}
@@ -87,9 +90,6 @@ Bank Transfer (if applicable):
   SWIFT: ${bank?.swift || ""}
   Currency: ${bank?.currency || ""}
   Reference: ${orderNo}
-
-Files:
-${linksText}
 `.trim();
 
   try {
@@ -105,123 +105,82 @@ ${linksText}
   }
 }
 
-// -------- main handler --------
-
+// ---------- main ----------
 exports.handler = async (event) => {
   try {
-    if (event.httpMethod !== "POST") {
-      return { statusCode: 405, body: "Method Not Allowed" };
-    }
+    if (event.httpMethod !== "POST") return { statusCode: 405, body: "Method Not Allowed" };
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-    // Normalize headers (case-insensitive)
-    const H = Object.fromEntries(
-      Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
-    );
+    // Normalize header
+    const H = Object.fromEntries(Object.entries(event.headers || {}).map(([k,v]) => [k.toLowerCase(), v]));
     const ct = (H["content-type"] || "").toLowerCase();
 
-    // ---- Mode A: JSON body (direct-upload path) ----
-    // Accept 'application/json' (with charset) and also 'text/plain' if the payload is JSON.
+    // ---- A) JSON mode: { meta, uploadedByItem:[{itemId, path}] }
     const looksLikeJson =
       ct.includes("application/json") ||
       (ct.includes("text/plain") && typeof event.body === "string" && event.body.trim().startsWith("{"));
 
     if (looksLikeJson) {
-      let parsed;
-      try {
-        parsed = JSON.parse(event.body || "{}");
-      } catch (e) {
-        return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON body" }) };
-      }
+      const { meta, uploadedByItem = [] } = JSON.parse(event.body || "{}");
+      if (!meta?.orderNo) return { statusCode: 400, body: JSON.stringify({ error: "Missing meta.orderNo" }) };
 
-      const { meta, uploadedPaths = [] } = parsed;
-      if (!meta?.orderNo) {
-        return { statusCode: 400, body: JSON.stringify({ error: "Missing meta.orderNo" }) };
-      }
-
-      // Ensure bucket-relative paths (strip any accidental "orders/")
-      const relPaths = uploadedPaths.map((p) => String(p).replace(/^orders\//, ""));
-
-      let fileLinks = [];
+      const relPaths = uploadedByItem.map(x => String(x.path).replace(/^orders\//, "")); // bucket-relative
+      let urls = [];
       if (relPaths.length) {
         const { data, error } = await supabase
-          .storage
-          .from("orders")
+          .storage.from("orders")
           .createSignedUrls(relPaths, 60 * 60 * 24 * 7);
-
-        if (error) {
-          return {
-            statusCode: 500,
-            body: JSON.stringify({ error: "Signed URL error", detail: error.message }),
-          };
-        }
-        fileLinks = data.map((d) => ({ path: d.path, url: d.signedUrl }));
+        if (error) return { statusCode: 500, body: JSON.stringify({ error: "Signed URL error", detail: error.message }) };
+        urls = data; // array of { path, signedUrl }
       }
 
-      await emailOrder(meta, fileLinks);
-      return {
-        statusCode: 200,
-        body: JSON.stringify({
-          ok: true,
-          orderNo: meta.orderNo,
-          uploaded: relPaths.length,
-          files: fileLinks,
-        }),
-      };
+      // stitch back itemId + signed url
+      const filesByItem = uploadedByItem.map(x => {
+        const m = urls.find(u => u.path === x.path.replace(/^orders\//, ""));
+        return { itemId: x.itemId, path: (m?.path || x.path), url: m?.signedUrl || null };
+      });
+
+      await emailOrder(meta, filesByItem);
+
+      return { statusCode: 200, body: JSON.stringify({ ok: true, orderNo: meta.orderNo, filesByItem }) };
     }
 
-    // ---- Mode B: Multipart FormData (legacy small-file path) ----
+    // ---- B) Multipart legacy (kept for backward compatibility) ----
     const { fields, files } = await parseMultipart(event);
 
-    // meta.json can be a field or a file
     let meta;
-    const metaFile = files.find(
-      (f) => f.fieldname === "meta" || (f.filename || "").toLowerCase() === "meta.json"
-    );
+    const metaFile = files.find(f => f.fieldname === "meta" || (f.filename || "").toLowerCase() === "meta.json");
     if (metaFile) meta = JSON.parse(metaFile.data.toString("utf8"));
     else if (fields.meta) meta = JSON.parse(fields.meta);
     else return { statusCode: 400, body: JSON.stringify({ error: "Missing meta" }) };
 
     if (!meta?.orderNo) return { statusCode: 400, body: JSON.stringify({ error: "Missing orderNo in meta" }) };
 
-    const uploadedKeys = [];
+    const uploaded = [];
     for (const f of files) {
       if (f === metaFile) continue;
       if (f.fieldname !== "files") continue;
-
-      // Store at bucket-relative key (NO leading "orders/")
+      // legacy: store under order root
       const key = `${sanitize(meta.orderNo)}/${sanitize(f.filename)}`;
-
-      const { error: upErr } = await supabase
-        .storage
-        .from("orders")
-        .upload(key, f.data, { contentType: f.contentType, upsert: true });
-
-      if (upErr) {
-        return { statusCode: 500, body: JSON.stringify({ error: "Upload failed", detail: upErr.message }) };
-      }
-      uploadedKeys.push(key);
+      const { error: upErr } = await supabase.storage.from("orders").upload(key, f.data, { contentType: f.contentType, upsert: true });
+      if (upErr) return { statusCode: 500, body: JSON.stringify({ error: "Upload failed", detail: upErr.message }) };
+      uploaded.push({ itemId: null, path: key });
     }
 
-    let fileLinks = [];
-    if (uploadedKeys.length) {
+    let urls = [];
+    if (uploaded.length) {
       const { data, error } = await supabase
-        .storage
-        .from("orders")
-        .createSignedUrls(uploadedKeys, 60 * 60 * 24 * 7);
-
-      if (error) {
-        return { statusCode: 500, body: JSON.stringify({ error: "Signed URL error", detail: error.message }) };
-      }
-      fileLinks = (data || []).map((d) => ({ path: d.path, url: d.signedUrl }));
+        .storage.from("orders")
+        .createSignedUrls(uploaded.map(u => u.path), 60 * 60 * 24 * 7);
+      if (error) return { statusCode: 500, body: JSON.stringify({ error: "Signed URL error", detail: error.message }) };
+      urls = data;
     }
 
-    await emailOrder(meta, fileLinks);
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ ok: true, orderNo: meta.orderNo, uploaded: uploadedKeys.length, files: fileLinks }),
-    };
+    const filesByItem = uploaded.map((u, i) => ({ itemId: null, path: urls[i].path, url: urls[i].signedUrl }));
+    await emailOrder(meta, filesByItem);
+
+    return { statusCode: 200, body: JSON.stringify({ ok: true, orderNo: meta.orderNo, filesByItem }) };
   } catch (e) {
     console.error("create-order error:", e);
     return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
