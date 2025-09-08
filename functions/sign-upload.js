@@ -1,31 +1,27 @@
-// functions/sign-upload.js
-const { createClient } = require("@supabase/supabase-js");
+import { createClient } from '@supabase/supabase-js'
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const url = process.env.SUPABASE_URL
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const bucket = process.env.ORDERS_BUCKET || 'orders'
 
-function sanitize(s) { return String(s || "").replace(/[^a-z0-9._-]+/gi, "-"); }
+const supa = createClient(url, serviceKey, { auth: { persistSession:false } })
 
-exports.handler = async (event) => {
-  try {
-    if (event.httpMethod !== "POST") return { statusCode: 405, body: "Method Not Allowed" };
-    const { orderNo, filename, itemId } = JSON.parse(event.body || "{}");
-    if (!orderNo || !filename || !itemId) {
-      return { statusCode: 400, body: JSON.stringify({ error: "orderNo, filename, itemId required" }) };
-    }
-
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
-    // Bucket-relative path: <orderNo>/<itemId>/<filename>
-    const objectPath = `${sanitize(orderNo)}/${sanitize(itemId)}/${sanitize(filename)}`;
-
-    const { data, error } = await supabase
-      .storage.from("orders")
-      .createSignedUploadUrl(objectPath);
-
-    if (error) return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
-
-    return { statusCode: 200, body: JSON.stringify({ signedUrl: data.signedUrl, path: objectPath, itemId }) };
-  } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
+export async function handler(event){
+  if (event.httpMethod !== 'POST'){
+    return { statusCode: 405, body: 'Method not allowed' }
   }
-};
+  try{
+    const { filename, draftId } = JSON.parse(event.body||'{}')
+    if (!filename || !draftId) return { statusCode: 400, body: 'filename and draftId required' }
+
+    const clean = filename.toLowerCase().replace(/[^a-z0-9.\-_]+/g, '-').slice(0,120) || 'file'
+    const path = `tmp/${draftId}/${Date.now()}-${clean}`
+
+    const { data, error } = await supa.storage.from(bucket).createSignedUploadUrl(path)
+    if (error) throw error
+
+    return { statusCode: 200, body: JSON.stringify({ bucket, path: data.path, token: data.token }) }
+  }catch(ex){
+    return { statusCode: 500, body: String(ex.message || ex) }
+  }
+}
